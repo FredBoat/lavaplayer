@@ -54,6 +54,7 @@ public class YoutubeAudioTrack extends DelegatedAudioTrack {
           .build();
 
   private final YoutubeAudioSourceManager sourceManager;
+  private final String refererUrl;
 
   /**
    * @param trackInfo Track info
@@ -61,8 +62,8 @@ public class YoutubeAudioTrack extends DelegatedAudioTrack {
    */
   public YoutubeAudioTrack(AudioTrackInfo trackInfo, YoutubeAudioSourceManager sourceManager) {
     super(trackInfo);
-
     this.sourceManager = sourceManager;
+    this.refererUrl = "https://www.youtube.com/watch?v=" + trackInfo.identifier;
   }
 
   @Override
@@ -126,16 +127,19 @@ public class YoutubeAudioTrack extends DelegatedAudioTrack {
       return new Tuple<>(cachedPlaybackFormat, true);
     }
 
-    JsonBrowser info = getTrackInfo(httpInterface);
+    final YoutubeAudioSourceManager.YoutubeJsonResponse jsonResponse = getTrackInfo(httpInterface);
 
-    String playerScript = extractPlayerScriptFromInfo(info);
-    List<YoutubeTrackFormat> formats = loadTrackFormats(info, httpInterface, playerScript);
+    String playerScript = extractPlayerScriptFromInfo(jsonResponse.getPlayerInfo());
+    List<YoutubeTrackFormat> formats = loadTrackFormats(jsonResponse.getPlayerInfo(), httpInterface, playerScript);
     YoutubeTrackFormat format = findBestSupportedFormat(formats);
 
     URI signedUrl = sourceManager.getCipherManager().getValidUrl(httpInterface, playerScript, format);
     FormatWithUrl bestFormat = new FormatWithUrl(format, signedUrl);
 
     playbackFormatCache.put(videoId, bestFormat);
+
+    callPreconnectUrls(httpInterface, jsonResponse.getPreConnectUrls());
+
     return new Tuple<>(bestFormat, false);
   }
 
@@ -149,7 +153,17 @@ public class YoutubeAudioTrack extends DelegatedAudioTrack {
     return sourceManager;
   }
 
-  private JsonBrowser getTrackInfo(HttpInterface httpInterface) throws Exception {
+  private void callPreconnectUrls(final HttpInterface httpInterface, final String[] preConnectUrls) throws IOException {
+    for (final String url : preConnectUrls) {
+      final HttpGet httpGet = new HttpGet(url);
+      httpGet.setHeader("Accept", "image/webp, */*");
+      httpGet.setHeader("Referer", this.refererUrl);
+      final CloseableHttpResponse response = httpInterface.execute(httpGet);
+      response.close();
+    }
+  }
+
+  private YoutubeAudioSourceManager.YoutubeJsonResponse getTrackInfo(HttpInterface httpInterface) throws Exception {
     return sourceManager.getTrackInfoFromMainPage(httpInterface, getIdentifier(), true);
   }
 
