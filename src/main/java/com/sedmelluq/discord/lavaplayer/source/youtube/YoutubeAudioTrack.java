@@ -1,7 +1,5 @@
 package com.sedmelluq.discord.lavaplayer.source.youtube;
 
-import com.google.common.cache.Cache;
-import com.google.common.cache.CacheBuilder;
 import com.sedmelluq.discord.lavaplayer.container.matroska.MatroskaAudioTrack;
 import com.sedmelluq.discord.lavaplayer.container.mpeg.MpegAudioTrack;
 import com.sedmelluq.discord.lavaplayer.source.AudioSourceManager;
@@ -15,6 +13,8 @@ import com.sedmelluq.discord.lavaplayer.track.AudioTrackInfo;
 import com.sedmelluq.discord.lavaplayer.track.DelegatedAudioTrack;
 import com.sedmelluq.discord.lavaplayer.track.playback.LocalAudioTrackExecutor;
 import java.nio.charset.StandardCharsets;
+
+import org.apache.http.NameValuePair;
 import org.apache.http.client.methods.CloseableHttpResponse;
 import org.apache.http.client.methods.HttpGet;
 import org.apache.http.client.utils.URLEncodedUtils;
@@ -28,12 +28,7 @@ import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
 import java.net.URI;
-import java.util.ArrayList;
-import java.util.Collections;
-import java.util.List;
-import java.util.Map;
-import java.util.StringJoiner;
-import java.util.concurrent.TimeUnit;
+import java.util.*;
 
 import static com.sedmelluq.discord.lavaplayer.container.Formats.MIME_AUDIO_WEBM;
 import static com.sedmelluq.discord.lavaplayer.source.youtube.YoutubeAudioSourceManager.CHARSET;
@@ -49,12 +44,7 @@ public class YoutubeAudioTrack extends DelegatedAudioTrack {
 
   private static final String DEFAULT_SIGNATURE_KEY = "signature";
 
-  private static final Cache<String, FormatWithUrl> playbackFormatCache = CacheBuilder.newBuilder()
-          .expireAfterWrite(4, TimeUnit.HOURS)
-          .build();
-
   private final YoutubeAudioSourceManager sourceManager;
-  private final String refererUrl;
 
   /**
    * @param trackInfo Track info
@@ -62,8 +52,8 @@ public class YoutubeAudioTrack extends DelegatedAudioTrack {
    */
   public YoutubeAudioTrack(AudioTrackInfo trackInfo, YoutubeAudioSourceManager sourceManager) {
     super(trackInfo);
+
     this.sourceManager = sourceManager;
-    this.refererUrl = "https://www.youtube.com/watch?v=" + trackInfo.identifier;
   }
 
   @Override
@@ -77,7 +67,9 @@ public class YoutubeAudioTrack extends DelegatedAudioTrack {
         processInternal(localExecutor, httpInterface, format);
       } catch (Exception ex) {
         if (cacheHit) {
-          playbackFormatCache.invalidate(getIdentifier());
+          if (sourceManager.getCacheProvider() != null) {
+            sourceManager.getCacheProvider().removeVideoFormat(getIdentifier());
+          }
           Tuple<FormatWithUrl, Boolean> newFormat = loadBestFormatWithUrl(httpInterface);
           processInternal(localExecutor, httpInterface, newFormat.l);
         } else {
@@ -119,28 +111,41 @@ public class YoutubeAudioTrack extends DelegatedAudioTrack {
   }
 
   private Tuple<FormatWithUrl, Boolean> loadBestFormatWithUrl(HttpInterface httpInterface) throws Exception {
-    String videoId = getIdentifier();
-    FormatWithUrl cachedPlaybackFormat = playbackFormatCache.getIfPresent(videoId);
+    FormatWithUrl cachedPlaybackFormat = loadFromCache();
 
     if (cachedPlaybackFormat != null) {
-      log.debug("Using cached playback URL for video {}", videoId);
+      log.debug("Using cached playback URL for video {}", getIdentifier());
       return new Tuple<>(cachedPlaybackFormat, true);
     }
 
-    final YoutubeAudioSourceManager.YoutubeJsonResponse jsonResponse = getTrackInfo(httpInterface);
+    JsonBrowser info = getTrackInfo(httpInterface);
 
-    String playerScript = extractPlayerScriptFromInfo(jsonResponse.getPlayerInfo());
-    List<YoutubeTrackFormat> formats = loadTrackFormats(jsonResponse.getPlayerInfo(), httpInterface, playerScript);
+    String playerScript = extractPlayerScriptFromInfo(info);
+    List<YoutubeTrackFormat> formats = loadTrackFormats(info, httpInterface, playerScript);
     YoutubeTrackFormat format = findBestSupportedFormat(formats);
 
     URI signedUrl = sourceManager.getCipherManager().getValidUrl(httpInterface, playerScript, format);
     FormatWithUrl bestFormat = new FormatWithUrl(format, signedUrl);
 
-    playbackFormatCache.put(videoId, bestFormat);
+    if (sourceManager.getCacheProvider() != null) {
+      String identifier = getIdentifier();
+      List<NameValuePair> queryParams = URLEncodedUtils.parse(signedUrl, StandardCharsets.UTF_8);
+      Optional<NameValuePair> expireParam = queryParams.stream().filter(param -> "expire".equals(param.getName())).findFirst();
 
-    callPreconnectUrls(httpInterface, jsonResponse.getPreConnectUrls());
+      String expire = expireParam.isPresent() ? expireParam.get().getValue() : "0";
+      long ttl = Long.parseLong(expire) * 1000;
 
+      sourceManager.getCacheProvider().cacheVideoFormat(identifier, bestFormat, ttl);
+    }
     return new Tuple<>(bestFormat, false);
+  }
+
+  private FormatWithUrl loadFromCache() {
+    if (sourceManager.getCacheProvider() == null) {
+      return null;
+    }
+
+    return sourceManager.getCacheProvider().getVideoFormat(getIdentifier());
   }
 
   @Override
@@ -153,17 +158,7 @@ public class YoutubeAudioTrack extends DelegatedAudioTrack {
     return sourceManager;
   }
 
-  private void callPreconnectUrls(final HttpInterface httpInterface, final String[] preConnectUrls) throws IOException {
-    for (final String url : preConnectUrls) {
-      final HttpGet httpGet = new HttpGet(url);
-      httpGet.setHeader("Accept", "image/webp, */*");
-      httpGet.setHeader("Referer", this.refererUrl);
-      final CloseableHttpResponse response = httpInterface.execute(httpGet);
-      response.close();
-    }
-  }
-
-  private YoutubeAudioSourceManager.YoutubeJsonResponse getTrackInfo(HttpInterface httpInterface) throws Exception {
+  private JsonBrowser getTrackInfo(HttpInterface httpInterface) throws Exception {
     return sourceManager.getTrackInfoFromMainPage(httpInterface, getIdentifier(), true);
   }
 
@@ -411,11 +406,11 @@ public class YoutubeAudioTrack extends DelegatedAudioTrack {
     return convertToMapLayout(URLEncodedUtils.parse(input, StandardCharsets.UTF_8));
   }
 
-  private static class FormatWithUrl {
-    private final YoutubeTrackFormat details;
-    private final URI signedUrl;
+  public static class FormatWithUrl {
+    public final YoutubeTrackFormat details;
+    public final URI signedUrl;
 
-    private FormatWithUrl(YoutubeTrackFormat details, URI signedUrl) {
+    public FormatWithUrl(YoutubeTrackFormat details, URI signedUrl) {
       this.details = details;
       this.signedUrl = signedUrl;
     }

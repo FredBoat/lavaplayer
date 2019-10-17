@@ -5,6 +5,9 @@ import com.sedmelluq.discord.lavaplayer.player.DefaultAudioPlayerManager;
 import com.sedmelluq.discord.lavaplayer.source.AudioSourceManager;
 import com.sedmelluq.discord.lavaplayer.tools.*;
 import com.sedmelluq.discord.lavaplayer.tools.http.BalancingIpv6RoutePlanner;
+import com.sedmelluq.discord.lavaplayer.tools.ExceptionTools;
+import com.sedmelluq.discord.lavaplayer.tools.FriendlyException;
+import com.sedmelluq.discord.lavaplayer.tools.JsonBrowser;
 import com.sedmelluq.discord.lavaplayer.tools.http.HttpRequestModifier;
 import com.sedmelluq.discord.lavaplayer.tools.io.HttpClientTools;
 import com.sedmelluq.discord.lavaplayer.tools.io.HttpConfigurable;
@@ -38,10 +41,6 @@ import org.apache.http.client.utils.URIBuilder;
 import org.apache.http.conn.routing.HttpRoutePlanner;
 import org.apache.http.impl.client.HttpClientBuilder;
 import org.apache.http.util.EntityUtils;
-import org.jsoup.Jsoup;
-import org.jsoup.nodes.Document;
-import org.jsoup.nodes.Element;
-import org.jsoup.select.Elements;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -81,6 +80,7 @@ public class YoutubeAudioSourceManager implements AudioSourceManager, HttpConfig
   private final YoutubeMixProvider mixProvider;
   private final boolean allowSearch;
   private volatile int playlistPageCount;
+  private CacheProvider cacheProvider;
 
   /**
    * Create an instance with default settings.
@@ -129,6 +129,10 @@ public class YoutubeAudioSourceManager implements AudioSourceManager, HttpConfig
    */
   public void setPlaylistPageCount(int playlistPageCount) {
     this.playlistPageCount = playlistPageCount;
+  }
+
+  public void setCacheProvider(CacheProvider provider) {
+    this.cacheProvider = provider;
   }
 
   /**
@@ -181,6 +185,10 @@ public class YoutubeAudioSourceManager implements AudioSourceManager, HttpConfig
 
   public YoutubeSignatureCipherManager getCipherManager() {
     return signatureCipherManager;
+  }
+
+  public CacheProvider getCacheProvider() {
+    return this.cacheProvider;
   }
 
   /**
@@ -382,7 +390,8 @@ public class YoutubeAudioSourceManager implements AudioSourceManager, HttpConfig
    *         <code>false</code>.
    * @throws IOException On network error.
    */
-  public YoutubeJsonResponse getTrackInfoFromMainPage(HttpInterface httpInterface, String videoId, boolean mustExist) throws IOException {
+  public JsonBrowser getTrackInfoFromMainPage(HttpInterface httpInterface, String videoId, boolean mustExist) throws IOException {
+    checkVideoAvailability(videoId);
     String url = getWatchUrl(videoId) + "&pbj=1&hl=en";
 
     try (CloseableHttpResponse response = httpInterface.execute(new HttpGet(url))) {
@@ -412,7 +421,7 @@ public class YoutubeAudioSourceManager implements AudioSourceManager, HttpConfig
           }
         }
 
-        if (!checkStatusBlock(statusBlock, mustExist)) {
+        if (!checkStatusBlock(videoId, statusBlock, mustExist)) {
           return null;
         } else if (playerInfo == null || playerInfo.isNull()) {
           throw new RuntimeException("No player info block.");
@@ -426,7 +435,7 @@ public class YoutubeAudioSourceManager implements AudioSourceManager, HttpConfig
     }
   }
 
-  private boolean checkStatusBlock(JsonBrowser statusBlock, boolean mustExist) {
+  private boolean checkStatusBlock(String videoId, JsonBrowser statusBlock, boolean mustExist) {
     if (statusBlock == null || statusBlock.isNull()) {
       throw new RuntimeException("No playability status block.");
     }
@@ -443,12 +452,15 @@ public class YoutubeAudioSourceManager implements AudioSourceManager, HttpConfig
       if (!mustExist && "Video unavailable".equals(reason)) {
         return false;
       } else {
+        cacheUnavailableVideo(videoId, reason);
         throw new FriendlyException(reason, COMMON, null);
       }
     } else if ("UNPLAYABLE".equals(status) || "LOGIN_REQUIRED".equals(status)) {
       String unplayableReason = getUnplayableReason(statusBlock);
+      cacheUnavailableVideo(videoId, unplayableReason);
       throw new FriendlyException(unplayableReason, COMMON, null);
     } else {
+      cacheUnavailableVideo(videoId, "This video cannot be viewed anonymously.");
       throw new FriendlyException("This video cannot be viewed anonymously.", COMMON, null);
     }
   }
@@ -581,7 +593,7 @@ public class YoutubeAudioSourceManager implements AudioSourceManager, HttpConfig
 
     if (!continuations.isNull()) {
       String continuationsToken = continuations.index(0).safeGet("nextContinuationData").safeGet("continuation").text();
-      return "/browse_ajax" + "?continuation=" + continuationsToken + "&ctoken=" + continuationsToken + "&hl=en";
+      return "/browse_ajax?continuation=" + continuationsToken + "&ctoken=" + continuationsToken + "&hl=en";
     }
 
     return null;
@@ -598,6 +610,23 @@ public class YoutubeAudioSourceManager implements AudioSourceManager, HttpConfig
   public YoutubeAudioTrack buildTrackObject(String videoId, String title, String uploader, boolean isStream, long duration) {
     return new YoutubeAudioTrack(new AudioTrackInfo(title, uploader, duration, videoId, isStream, getWatchUrl(videoId),
         Collections.singletonMap("artworkUrl", getArtworkUrl(videoId))), this);
+  }
+
+  private void checkVideoAvailability(String videoId) {
+    if (cacheProvider != null) {
+
+      String reason = cacheProvider.checkUnavailable(videoId);
+
+      if (reason != null) {
+        throw new FriendlyException(reason, COMMON, null);
+      }
+    }
+  }
+
+  private void cacheUnavailableVideo(String videoId, String reason) {
+    if (cacheProvider != null) {
+      cacheProvider.cacheUnavailableVideo(videoId, reason);
+    }
   }
 
   private static String getWatchUrl(String videoId) {
